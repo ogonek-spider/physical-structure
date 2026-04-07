@@ -1,9 +1,21 @@
 I have 18 motors from hoverboard 7nm torque. 
 
-Motors have 3d printed two stage planetary 1:36 gearbox (about 250nm torque). 
-Gears printed from pc16 cf. 
+Motor casing is 3d printed from petg
+
 Motors have magnetic absolute encoder and current sensor. 
-Weight of one motor is 3kg. 
+Weight of one motor is 1.5kg. Full joint weight about 5kg
+
+## Planetary gearbox
+Motors have 3d printed two stage planetary 1:36 gearbox (about 250nm torque). 
+Gears printed from PA6-CF. Lubricated with thick grease https://smazka.ru/shop/mc-rubin/
+
+Module 2mm
+Number of planets 3
+Helical 15 degrees
+Depth 16mm
+Ring 60 teeth
+Sun 12 teeth
+Planet 24 teeth
 
 ## Components
 ### esp32 s3
@@ -31,9 +43,6 @@ Uses two cables twai lo and twai hi
 
 #### CAN topology
 STAR with Central s3 in the center. Each leg has three motor connected in line
-
-FIXME:
-* somehow super unreliable thing, cant get it to work
 
 ## PID
 
