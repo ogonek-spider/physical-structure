@@ -1,0 +1,327 @@
+' ============================================================
+'  extract_pose_and_solve.iLogicVb  (iLogic, Inventor 2026)
+'  -----------------------------------------------------------
+'  «Одна кнопка»:
+'    1) считывает 18 углов суставов из активной сборки
+'    2) пишет hexapod_pose.json
+'    3) запускает hexapod_moments_solver.py и показывает таблицу
+'       моментов в окне с моноширинным шрифтом.
+'
+'  Соглашение: в дереве сборки 18 вращательных суставов должны
+'  быть переименованы в:
+'    joint_L1_coxa, joint_L1_femur, joint_L1_tibia, ..., joint_R3_tibia
+' ============================================================
+
+' iLogic вызывает Sub Main() как точку входа.
+Sub Main()
+    ' === НАСТРОЙКИ (правь под свою установку) ===
+    Const SOLVER_REL_PATH As String = "..\hexapod_moments_solver.py"
+    Const MODEL_REL_PATH  As String = "..\hexapod_model.json"
+    Const POSE_REL_PATH   As String = "..\hexapod_pose.json"
+    Const PYTHON_EXE      As String = "python.exe"
+    Const PROC_TIMEOUT_SEC As Integer = 60
+    ' ============================================
+
+    ' --- Проверки документа ---
+    If String.IsNullOrEmpty(ThisDoc.Path) Then
+        MessageBox.Show("Сначала сохрани сборку — нужен путь до папки документа.",
+                        "Hexapod solver", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        Return
+    End If
+
+    Dim oAsmDoc As AssemblyDocument = TryCast(ThisApplication.ActiveDocument, AssemblyDocument)
+    If oAsmDoc Is Nothing Then
+        MessageBox.Show("Активный документ — не сборка. Открой _Full_Ass_.iam.",
+                        "Hexapod solver", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        Return
+    End If
+    Dim oCompDef As AssemblyComponentDefinition = oAsmDoc.ComponentDefinition
+
+    ' --- Резолв путей ---
+    Dim baseDir    As String = ThisDoc.Path
+    Dim solverPath As String = ResolveRelative(baseDir, SOLVER_REL_PATH)
+    Dim modelPath  As String = ResolveRelative(baseDir, MODEL_REL_PATH)
+    Dim posePath   As String = ResolveRelative(baseDir, POSE_REL_PATH)
+
+    If Not System.IO.File.Exists(solverPath) Then
+        MessageBox.Show("Не найден решатель:" & vbCrLf & solverPath & vbCrLf & vbCrLf &
+                        "Проверь SOLVER_REL_PATH в начале правила.",
+                        "Hexapod solver", MessageBoxButtons.OK, MessageBoxIcon.Error)
+        Return
+    End If
+    If Not System.IO.File.Exists(modelPath) Then
+        MessageBox.Show("Не найдена модель:" & vbCrLf & modelPath & vbCrLf & vbCrLf &
+                        "Запусти extract_model или положи готовый JSON.",
+                        "Hexapod solver", MessageBoxButtons.OK, MessageBoxIcon.Error)
+        Return
+    End If
+
+    ' --- Считываем 18 углов ---
+    Dim legCodes()  As String = New String() {"L1", "L2", "L3", "R1", "R2", "R3"}
+    Dim partCodes() As String = New String() {"coxa", "femur", "tibia"}
+
+    Dim pose    As New System.Collections.Generic.Dictionary(Of String, Double)
+    Dim missing As New System.Collections.Generic.List(Of String)
+
+    For legIdx As Integer = 0 To 5
+        For partIdx As Integer = 0 To 2
+            Dim jName As String = "joint_" & legCodes(legIdx) & "_" & partCodes(partIdx)
+            Dim oJoint As AssemblyJoint = FindJointByName(oCompDef, jName)
+            If oJoint Is Nothing Then
+                missing.Add(jName)
+            Else
+                pose("leg_" & legIdx & "_" & partCodes(partIdx)) = ReadAngularPositionRad(oJoint)
+            End If
+        Next
+    Next
+
+    If missing.Count > 0 Then
+        Dim namesList As String = String.Join(vbCrLf & "  ", missing.ToArray())
+        MessageBox.Show(
+            "Не найдены суставы (" & missing.Count & "):" & vbCrLf &
+            "  " & namesList & vbCrLf & vbCrLf &
+            "Переименуй их в дереве сборки в:" & vbCrLf &
+            "  joint_L1_coxa ... joint_R3_tibia" & vbCrLf & vbCrLf &
+            "Сейчас в сборке такие суставы:" & vbCrLf & ListAllJointNames(oCompDef),
+            "Hexapod solver: суставы не найдены",
+            MessageBoxButtons.OK, MessageBoxIcon.Error)
+        Return
+    End If
+
+    ' --- Записываем pose.json ---
+    Try
+        WritePoseJson(posePath, pose)
+    Catch ex As Exception
+        MessageBox.Show("Ошибка записи позы:" & vbCrLf & posePath & vbCrLf & ex.Message,
+                        "Hexapod solver", MessageBoxButtons.OK, MessageBoxIcon.Error)
+        Return
+    End Try
+
+    ' --- Запускаем python ---
+    Dim stdoutText As String = ""
+    Dim stderrText As String = ""
+    Dim exitCode   As Integer = -1
+    Try
+        RunSolverProcess(PYTHON_EXE, solverPath, modelPath, posePath,
+                         PROC_TIMEOUT_SEC,
+                         stdoutText, stderrText, exitCode)
+    Catch ex As Exception
+        MessageBox.Show("Ошибка запуска python:" & vbCrLf & ex.Message & vbCrLf & vbCrLf &
+                        "Проверь, что python в PATH (или поправь PYTHON_EXE)." & vbCrLf &
+                        "Установлен ли numpy: pip install numpy",
+                        "Hexapod solver", MessageBoxButtons.OK, MessageBoxIcon.Error)
+        Return
+    End Try
+
+    ' --- Окно с результатом ---
+    Dim header As String =
+        "Решатель: " & solverPath & vbCrLf &
+        "Модель:   " & modelPath & vbCrLf &
+        "Поза:     " & posePath  & vbCrLf &
+        "Exit:     " & exitCode  & vbCrLf &
+        New String("="c, 75) & vbCrLf
+
+    Dim body As String = stdoutText
+    If exitCode <> 0 OrElse Not String.IsNullOrWhiteSpace(stderrText) Then
+        body &= vbCrLf & New String("-"c, 75) & vbCrLf &
+                "STDERR:" & vbCrLf & stderrText
+    End If
+
+    ShowResultForm("Моменты в суставах гексапода", header & body)
+End Sub
+
+
+' ============================================================
+'   ПОИСК СУСТАВА И ЧТЕНИЕ УГЛА
+' ============================================================
+Function FindJointByName(oCompDef As AssemblyComponentDefinition,
+                          ByVal name As String) As AssemblyJoint
+    For Each j As AssemblyJoint In oCompDef.Joints
+        If String.Equals(j.Name, name, StringComparison.OrdinalIgnoreCase) Then
+            Return j
+        End If
+    Next
+    Return Nothing
+End Function
+
+
+Function ReadAngularPositionRad(oJoint As AssemblyJoint) As Double
+    ' AssemblyJoint.Definition имеет AngularPosition только для
+    ' kRotationalJointType (revolute) и kCylindricalJointType.
+    Dim jt As AssemblyJointTypeEnum = oJoint.Definition.JointType
+    If jt = AssemblyJointTypeEnum.kRotationalJointType _
+       OrElse jt = AssemblyJointTypeEnum.kCylindricalJointType Then
+        Return CDbl(oJoint.Definition.AngularPosition.Value)  ' радианы
+    End If
+    Throw New Exception("Сустав '" & oJoint.Name &
+        "' не вращательный (JointType=" & jt.ToString() & ").")
+End Function
+
+
+Function ListAllJointNames(oCompDef As AssemblyComponentDefinition) As String
+    Dim sb  As New System.Text.StringBuilder()
+    Dim cnt As Integer = 0
+    For Each j As AssemblyJoint In oCompDef.Joints
+        sb.AppendLine("  " & j.Name & "   [" & j.Definition.JointType.ToString() & "]")
+        cnt += 1
+        If cnt >= 60 Then
+            sb.AppendLine("  ... (всего " & oCompDef.Joints.Count & ", обрезано)")
+            Exit For
+        End If
+    Next
+    If cnt = 0 Then sb.AppendLine("  (нет ни одного AssemblyJoint в сборке)")
+    Return sb.ToString()
+End Function
+
+
+' ============================================================
+'   ЗАПИСЬ POSE.JSON
+' ============================================================
+Sub WritePoseJson(ByVal path As String,
+                  pose As System.Collections.Generic.Dictionary(Of String, Double))
+    Dim sb  As New System.Text.StringBuilder()
+    Dim inv As System.Globalization.CultureInfo = System.Globalization.CultureInfo.InvariantCulture
+    Dim partCodes() As String = New String() {"coxa", "femur", "tibia"}
+
+    sb.AppendLine("{")
+    sb.AppendLine("  ""_comment"": ""Сгенерировано extract_pose_and_solve.iLogicVb. Углы в радианах."",")
+
+    Dim first As Boolean = True
+    For legIdx As Integer = 0 To 5
+        For partIdx As Integer = 0 To 2
+            Dim k As String = "leg_" & legIdx & "_" & partCodes(partIdx)
+            If Not first Then sb.AppendLine(",")
+            first = False
+            sb.Append("  """).Append(k).Append(""": ").Append(pose(k).ToString("0.######", inv))
+        Next
+    Next
+    sb.AppendLine()
+    sb.AppendLine("}")
+
+    System.IO.File.WriteAllText(path, sb.ToString(), New System.Text.UTF8Encoding(False))
+End Sub
+
+
+' ============================================================
+'   ЗАПУСК PYTHON РЕШАТЕЛЯ
+' ============================================================
+Sub RunSolverProcess(ByVal pythonExe As String,
+                     ByVal solverPath As String,
+                     ByVal modelPath As String,
+                     ByVal posePath As String,
+                     ByVal timeoutSec As Integer,
+                     ByRef stdoutText As String,
+                     ByRef stderrText As String,
+                     ByRef exitCode As Integer)
+
+    Dim psi As New System.Diagnostics.ProcessStartInfo()
+    psi.FileName = pythonExe
+    psi.Arguments = """" & solverPath & """ """ & modelPath & """ """ & posePath &
+                    """ --scenario all"
+    psi.UseShellExecute = False
+    psi.CreateNoWindow = True
+    psi.RedirectStandardOutput = True
+    psi.RedirectStandardError = True
+    psi.StandardOutputEncoding = System.Text.Encoding.UTF8
+    psi.StandardErrorEncoding  = System.Text.Encoding.UTF8
+    psi.EnvironmentVariables("PYTHONIOENCODING") = "utf-8"
+    psi.EnvironmentVariables("PYTHONUTF8") = "1"
+
+    Dim sbOut As New System.Text.StringBuilder()
+    Dim sbErr As New System.Text.StringBuilder()
+
+    Using p As New System.Diagnostics.Process()
+        p.StartInfo = psi
+        AddHandler p.OutputDataReceived,
+            Sub(sender, e)
+                If e.Data IsNot Nothing Then sbOut.AppendLine(e.Data)
+            End Sub
+        AddHandler p.ErrorDataReceived,
+            Sub(sender, e)
+                If e.Data IsNot Nothing Then sbErr.AppendLine(e.Data)
+            End Sub
+
+        If Not p.Start() Then
+            Throw New Exception("Process.Start вернул False")
+        End If
+        p.BeginOutputReadLine()
+        p.BeginErrorReadLine()
+
+        If Not p.WaitForExit(timeoutSec * 1000) Then
+            Try : p.Kill() : Catch : End Try
+            Throw New Exception("Решатель не уложился в " & timeoutSec & " сек.")
+        End If
+        ' Второй WaitForExit без таймаута — паттерн MS, чтобы async-обработчики дочитали поток
+        p.WaitForExit()
+        exitCode = p.ExitCode
+    End Using
+
+    stdoutText = sbOut.ToString()
+    stderrText = sbErr.ToString()
+End Sub
+
+
+' ============================================================
+'   ОКНО С РЕЗУЛЬТАТОМ
+' ============================================================
+Sub ShowResultForm(ByVal title As String, ByVal text As String)
+    Dim frm As New System.Windows.Forms.Form()
+    frm.Text = title
+    frm.Width = 820 : frm.Height = 640
+    frm.StartPosition = System.Windows.Forms.FormStartPosition.CenterParent
+    frm.MinimizeBox = False : frm.MaximizeBox = True
+
+    Dim tb As New System.Windows.Forms.TextBox()
+    tb.Multiline  = True
+    tb.ReadOnly   = True
+    tb.ScrollBars = System.Windows.Forms.ScrollBars.Both
+    tb.WordWrap   = False
+    tb.Dock       = System.Windows.Forms.DockStyle.Fill
+    tb.Font       = New System.Drawing.Font("Consolas", 10.0F)
+    tb.Text       = text.Replace(vbLf, vbCrLf).Replace(vbCr & vbCrLf, vbCrLf)
+    tb.SelectionStart  = 0
+    tb.SelectionLength = 0
+
+    Dim panel As New System.Windows.Forms.Panel()
+    panel.Dock   = System.Windows.Forms.DockStyle.Bottom
+    panel.Height = 36
+
+    Dim btnCopy As New System.Windows.Forms.Button()
+    btnCopy.Text  = "Копировать"
+    btnCopy.Width = 110 : btnCopy.Height = 28
+    btnCopy.Top   = 4   : btnCopy.Left   = 6
+    AddHandler btnCopy.Click,
+        Sub(s, e)
+            Try : System.Windows.Forms.Clipboard.SetText(text) : Catch : End Try
+        End Sub
+
+    Dim btnClose As New System.Windows.Forms.Button()
+    btnClose.Text   = "Закрыть"
+    btnClose.Width  = 110 : btnClose.Height = 28
+    btnClose.Top    = 4
+    btnClose.Anchor = System.Windows.Forms.AnchorStyles.Top Or
+                       System.Windows.Forms.AnchorStyles.Right
+    btnClose.Left   = panel.ClientSize.Width - btnClose.Width - 6
+    AddHandler btnClose.Click, Sub(s, e) frm.Close()
+
+    panel.Controls.Add(btnCopy)
+    panel.Controls.Add(btnClose)
+    frm.Controls.Add(tb)
+    frm.Controls.Add(panel)
+
+    frm.ShowDialog()
+    frm.Dispose()
+End Sub
+
+
+' ============================================================
+'   УТИЛИТЫ
+' ============================================================
+Function ResolveRelative(ByVal baseDir As String, ByVal relPath As String) As String
+    If System.IO.Path.IsPathRooted(relPath) Then Return relPath
+    Try
+        Return System.IO.Path.GetFullPath(System.IO.Path.Combine(baseDir, relPath))
+    Catch
+        Return System.IO.Path.Combine(baseDir, relPath)
+    End Try
+End Function

@@ -1,0 +1,716 @@
+' ============================================================
+'  extract_model.iLogicVb  (iLogic, Inventor 2026)
+'  -----------------------------------------------------------
+'  Один раз: считывает геометрию + массы + РЕАЛЬНЫЕ ЦМ и пишет
+'  hexapod_model.json рядом с решателем.
+'
+'  Что нужно от пользователя в сборке:
+'    1) User Parameters: coxa_length, femur_length, tibia_length,
+'       body_radius (Length, любые единицы — Inventor хранит в см).
+'       Опционально: body_mass_offset_x/y/z (в локальной СК тела, любые длины).
+'    2) Имена сборок ног (см. LEG_OCC_NAMES внутри RunExtractModel).
+'    3) 18 переименованных вращательных суставов
+'       joint_L1_coxa ... joint_R3_tibia.
+'
+'  Локальный ЦМ звена считается так:
+'    com_world = MassProperties.CenterOfMass (см → м, в системе сборки),
+'    forward kinematics → link_origin_world и R_link при текущих углах,
+'    com_local = R_link^T * (com_world − link_origin_world).
+'  Локальный ЦМ инвариантен к позе — в JSON он остаётся валидным
+'  при любых поворотах суставов.
+' ============================================================
+
+' iLogic вызывает Sub Main() как точку входа.
+Sub Main()
+    ' === НАСТРОЙКИ ===
+    Const MODEL_REL_PATH As String = "..\hexapod_model.json"
+    Const BODY_OCC_NAME  As String = "body_frame"
+
+    Dim LEG_OCC_NAMES() As String = New String() {
+        "leg_Left_ass:1",   _
+        "leg_Left_ass:2",   _
+        "leg_Right_ass:3",  _
+        "leg_Right_ass:1",  _
+        "leg_Right_ass:2",  _
+        "leg_Left_ass:3"    _
+    }
+    Dim LEG_CODES()  As String = New String() {"L1","L2","L3","R1","R2","R3"}
+    Dim LEG_LABELS() As String = New String() { _
+        "L1 (Left, передняя)",  _
+        "L2 (Left, средняя)",   _
+        "L3 (Left, задняя)",    _
+        "R1 (Right, передняя)", _
+        "R2 (Right, средняя)",  _
+        "R3 (Right, задняя)"    _
+    }
+    Dim YAW_OFFSETS() As Double = New Double() { _
+         1.0472,  1.5708,  2.0944, _
+        -1.0472, -1.5708, -2.0944  _
+    }
+    Dim COXA_TOKENS()  As String = New String() {"coxa"}
+    Dim FEMUR_TOKENS() As String = New String() {"femur"}
+    Dim TIBIA_TOKENS() As String = New String() {"tibia", "tibea"}
+    ' =================
+
+    If String.IsNullOrEmpty(ThisDoc.Path) Then
+        MessageBox.Show("Сначала сохрани сборку.", "Hexapod model")
+        Return
+    End If
+
+    Dim oAsmDoc As AssemblyDocument = TryCast(ThisApplication.ActiveDocument, AssemblyDocument)
+    If oAsmDoc Is Nothing Then
+        MessageBox.Show("Активный документ — не сборка.", "Hexapod model")
+        Return
+    End If
+
+    Dim oCompDef As AssemblyComponentDefinition = oAsmDoc.ComponentDefinition
+    Dim warnings As New System.Collections.Generic.List(Of String)
+
+    ' --- tibia_length — единственный обязательный User Parameter ---
+    ' (длины coxa и femur измеряются из расстояний между origin'ами occurrence'ов;
+    '  tibia_length задаётся явно, потому что на кончике стопы нет сустава.)
+    EnsureUserParam(oCompDef, "tibia_length", 150.0, warnings)
+    Dim tibia_len_m As Double = ReadUserParamCm(oCompDef, "tibia_length", warnings) / 100.0
+
+    ' Опциональное смещение ЦМ тела (в локальной СК тела, метры)
+    Dim body_off_x As Double = ReadUserParamCmOpt(oCompDef, "body_mass_offset_x") / 100.0
+    Dim body_off_y As Double = ReadUserParamCmOpt(oCompDef, "body_mass_offset_y") / 100.0
+    Dim body_off_z As Double = ReadUserParamCmOpt(oCompDef, "body_mass_offset_z") / 100.0
+
+    ' --- Тело: масса, origin, ориентация ---
+    Dim oBody        As ComponentOccurrence = FindOccurrenceByName(oCompDef, BODY_OCC_NAME)
+    Dim body_mass_kg As Double = 0.0
+    Dim body_origin_m(2) As Double
+    Dim body_R(2, 2)     As Double
+    SetIdentity3(body_R)
+
+    If oBody Is Nothing Then
+        warnings.Add("Не найден occurrence '" & BODY_OCC_NAME & "' — body_origin=0, R=I.")
+    Else
+        body_mass_kg = SafeMassKg(oBody, "body_frame", warnings)
+        Dim t As Inventor.Matrix = oBody.Transformation
+        body_origin_m(0) = t.Cell(1, 4) / 100.0
+        body_origin_m(1) = t.Cell(2, 4) / 100.0
+        body_origin_m(2) = t.Cell(3, 4) / 100.0
+        For i As Integer = 0 To 2
+            For j As Integer = 0 To 2
+                body_R(i, j) = t.Cell(i + 1, j + 1)
+            Next
+        Next
+    End If
+
+    ' --- Ноги ---
+    Dim legs(5) As LegInfo
+    Dim allComsResolved As Boolean = True
+
+    For i As Integer = 0 To 5
+        legs(i) = New LegInfo()
+        legs(i).label = LEG_LABELS(i)
+        legs(i).tibia_len = tibia_len_m
+
+        ' fallback значения (заполнятся реальными ниже)
+        legs(i).yaw       = YAW_OFFSETS(i)
+        legs(i).attach_x  = 0.0 : legs(i).attach_y = 0.0 : legs(i).attach_z = 0.0
+        legs(i).coxa_len  = 0.0
+        legs(i).femur_len = 0.0
+        legs(i).coxa_com  = New Double() {0.0, 0.0, 0.0}
+        legs(i).femur_com = New Double() {0.0, 0.0, 0.0}
+        legs(i).tibia_com = New Double() {tibia_len_m / 2.0, 0.0, 0.0}
+        legs(i).coxa_com_simplified  = True
+        legs(i).femur_com_simplified = True
+        legs(i).tibia_com_simplified = True
+
+        Dim legOcc As ComponentOccurrence = FindOccurrenceByName(oCompDef, LEG_OCC_NAMES(i))
+        If legOcc Is Nothing Then
+            warnings.Add("Нога '" & LEG_OCC_NAMES(i) & "' не найдена — пропуск.")
+            legs(i).coxa_mass = 0.1 : legs(i).femur_mass = 0.15 : legs(i).tibia_mass = 0.1
+            allComsResolved = False
+            Continue For
+        End If
+
+        Dim oCoxa  As ComponentOccurrence = FindSubOccByTokens(legOcc, COXA_TOKENS)
+        Dim oFemur As ComponentOccurrence = FindSubOccByTokens(legOcc, FEMUR_TOKENS)
+        Dim oTibia As ComponentOccurrence = FindSubOccByTokens(legOcc, TIBIA_TOKENS)
+
+        legs(i).coxa_mass  = SafeMassKg(oCoxa,  LEG_OCC_NAMES(i) & "/coxa",  warnings)
+        legs(i).femur_mass = SafeMassKg(oFemur, LEG_OCC_NAMES(i) & "/femur", warnings)
+        legs(i).tibia_mass = SafeMassKg(oTibia, LEG_OCC_NAMES(i) & "/tibia", warnings)
+
+        ' Позиции origin'ов sub-occurrence'ов в мире (см → м).
+        ' Предполагается, что origin каждой детали (coxa.ipt / femur.ipt / tibia.ipt)
+        ' помещён на ось соответствующего сустава — стандартная практика моделирования.
+        ' Если это не так — длины и крепления получатся неточными; проверь визуально.
+        Dim coxa_pos_w()  As Double = OccPositionMeters(oCoxa)
+        Dim femur_pos_w() As Double = OccPositionMeters(oFemur)
+        Dim tibia_pos_w() As Double = OccPositionMeters(oTibia)
+
+        If coxa_pos_w Is Nothing OrElse femur_pos_w Is Nothing OrElse tibia_pos_w Is Nothing Then
+            warnings.Add("Ноге " & LEG_CODES(i) & ": одна или больше деталей не найдены — длины и крепление пропущены.")
+            allComsResolved = False
+            Continue For
+        End If
+
+        ' Длины звеньев = евклидовы расстояния
+        legs(i).coxa_len  = VecNorm(SubVec(femur_pos_w, coxa_pos_w))
+        legs(i).femur_len = VecNorm(SubVec(tibia_pos_w, femur_pos_w))
+
+        ' coxa_attachment в локальной СК тела
+        Dim attach_world() As Double = SubVec(coxa_pos_w, body_origin_m)
+        Dim attach_local() As Double = MatVec3(MatT3(body_R), attach_world)
+        legs(i).attach_x = attach_local(0)
+        legs(i).attach_y = attach_local(1)
+        legs(i).attach_z = attach_local(2)
+
+        ' yaw_offset из направления attach_local (в плоскости XY)
+        legs(i).yaw = Math.Atan2(attach_local(1), attach_local(0))
+
+        ' --- Реальные ЦМ через FK + проекцию ---
+        Dim a_coxa As Double = 0, a_femur As Double = 0, a_tibia As Double = 0
+        Dim anglesOk As Boolean = True
+        Try
+            Dim jc As AssemblyJoint = FindJointByName(oCompDef, "joint_" & LEG_CODES(i) & "_coxa")
+            Dim jf As AssemblyJoint = FindJointByName(oCompDef, "joint_" & LEG_CODES(i) & "_femur")
+            Dim jt As AssemblyJoint = FindJointByName(oCompDef, "joint_" & LEG_CODES(i) & "_tibia")
+            If jc Is Nothing OrElse jf Is Nothing OrElse jt Is Nothing Then
+                warnings.Add("Ноге " & LEG_CODES(i) & ": не все суставы joint_" & LEG_CODES(i) & "_* найдены — ЦМ упрощены.")
+                anglesOk = False
+            Else
+                a_coxa  = ReadAngularPositionRad(jc)
+                a_femur = ReadAngularPositionRad(jf)
+                a_tibia = ReadAngularPositionRad(jt)
+            End If
+        Catch ex As Exception
+            warnings.Add("Ноге " & LEG_CODES(i) & ": ошибка чтения углов (" & ex.Message & ") — ЦМ упрощены.")
+            anglesOk = False
+        End Try
+
+        If Not anglesOk Then
+            ' даже без углов — ЦМ tibia ставим как [tibia_len/2, 0, 0]
+            legs(i).coxa_com  = New Double() {legs(i).coxa_len  / 2.0, 0.0, 0.0}
+            legs(i).femur_com = New Double() {legs(i).femur_len / 2.0, 0.0, 0.0}
+            allComsResolved = False
+            Continue For
+        End If
+
+        ' Forward kinematics — используем измеренные длины и yaw
+        Dim attach()         As Double = New Double() {legs(i).attach_x, legs(i).attach_y, legs(i).attach_z}
+        Dim coxa_origin_w()  As Double = AddVec(body_origin_m, MatVec3(body_R, attach))
+        Dim R_leg(,)         As Double = MatMul3(MatMul3(body_R, RzMat(legs(i).yaw)), RzMat(a_coxa))
+        Dim coxa_to_femur()  As Double = New Double() {legs(i).coxa_len, 0, 0}
+        Dim femur_origin_w() As Double = AddVec(coxa_origin_w, MatVec3(R_leg, coxa_to_femur))
+        Dim R_femur(,)       As Double = MatMul3(R_leg, RyMat(a_femur))
+        Dim femur_to_tibia() As Double = New Double() {legs(i).femur_len, 0, 0}
+        Dim tibia_origin_w() As Double = AddVec(femur_origin_w, MatVec3(R_femur, femur_to_tibia))
+        Dim R_tibia(,)       As Double = MatMul3(R_femur, RyMat(a_tibia))
+
+        ' ЦМ в мире (см → м)
+        Dim coxa_com_w()  As Double = ReadComMeters(oCoxa)
+        Dim femur_com_w() As Double = ReadComMeters(oFemur)
+        Dim tibia_com_w() As Double = ReadComMeters(oTibia)
+
+        If coxa_com_w IsNot Nothing Then
+            legs(i).coxa_com = MatVec3(MatT3(R_leg), SubVec(coxa_com_w, coxa_origin_w))
+            legs(i).coxa_com_simplified = False
+        Else
+            legs(i).coxa_com = New Double() {legs(i).coxa_len / 2.0, 0.0, 0.0}
+            warnings.Add(LEG_CODES(i) & "/coxa: ЦМ не считан — fallback.")
+            allComsResolved = False
+        End If
+
+        If femur_com_w IsNot Nothing Then
+            legs(i).femur_com = MatVec3(MatT3(R_femur), SubVec(femur_com_w, femur_origin_w))
+            legs(i).femur_com_simplified = False
+        Else
+            legs(i).femur_com = New Double() {legs(i).femur_len / 2.0, 0.0, 0.0}
+            warnings.Add(LEG_CODES(i) & "/femur: ЦМ не считан — fallback.")
+            allComsResolved = False
+        End If
+
+        If tibia_com_w IsNot Nothing Then
+            legs(i).tibia_com = MatVec3(MatT3(R_tibia), SubVec(tibia_com_w, tibia_origin_w))
+            legs(i).tibia_com_simplified = False
+        Else
+            warnings.Add(LEG_CODES(i) & "/tibia: ЦМ не считан — fallback.")
+            allComsResolved = False
+        End If
+    Next
+
+    ' --- Запись JSON ---
+    Dim modelPath As String = ResolveRelative(ThisDoc.Path, MODEL_REL_PATH)
+    Try
+        WriteModelJson(modelPath, body_mass_kg, body_origin_m,
+                       body_off_x, body_off_y, body_off_z, legs, allComsResolved)
+    Catch ex As Exception
+        MessageBox.Show("Ошибка записи JSON: " & ex.Message,
+                        "Hexapod model", MessageBoxButtons.OK, MessageBoxIcon.Error)
+        Return
+    End Try
+
+    ' --- Отчёт ---
+    Dim sb As New System.Text.StringBuilder()
+    sb.AppendLine("Готово.")
+    sb.AppendLine("JSON: " & modelPath)
+    sb.AppendLine()
+    sb.AppendLine("Тело: масса = " & body_mass_kg.ToString("F4") & " кг")
+    sb.AppendLine("tibia_length = " & tibia_len_m.ToString("F4") & " м (User Parameter)")
+    sb.AppendLine()
+    sb.AppendLine("Геометрия ног (длины в м, измерены из позиций деталей):")
+    For i As Integer = 0 To 5
+        sb.AppendLine(LEG_LABELS(i) & ":")
+        sb.AppendLine(String.Format("  attach=[{0:F4}, {1:F4}, {2:F4}]  yaw={3:F2}°",
+            legs(i).attach_x, legs(i).attach_y, legs(i).attach_z, legs(i).yaw * 180.0 / Math.PI))
+        sb.AppendLine(String.Format("  длины: coxa={0:F4}  femur={1:F4}  tibia={2:F4}",
+            legs(i).coxa_len, legs(i).femur_len, legs(i).tibia_len))
+        sb.AppendLine(String.Format("  coxa  m={0:F3}  com=[{1:F4}, {2:F4}, {3:F4}]{4}",
+            legs(i).coxa_mass, legs(i).coxa_com(0), legs(i).coxa_com(1), legs(i).coxa_com(2),
+            IIf(legs(i).coxa_com_simplified, " (упрощено)", "")))
+        sb.AppendLine(String.Format("  femur m={0:F3}  com=[{1:F4}, {2:F4}, {3:F4}]{4}",
+            legs(i).femur_mass, legs(i).femur_com(0), legs(i).femur_com(1), legs(i).femur_com(2),
+            IIf(legs(i).femur_com_simplified, " (упрощено)", "")))
+        sb.AppendLine(String.Format("  tibia m={0:F3}  com=[{1:F4}, {2:F4}, {3:F4}]{4}",
+            legs(i).tibia_mass, legs(i).tibia_com(0), legs(i).tibia_com(1), legs(i).tibia_com(2),
+            IIf(legs(i).tibia_com_simplified, " (упрощено)", "")))
+    Next
+    If warnings.Count > 0 Then
+        sb.AppendLine()
+        sb.AppendLine("ПРЕДУПРЕЖДЕНИЯ (" & warnings.Count & "):")
+        For Each w As String In warnings
+            sb.AppendLine("  - " & w)
+        Next
+    End If
+
+    ' Если суставы для всех 6 ног упрощены — это значит они не переименованы.
+    ' Покажем список текущих суставов, чтобы пользователь понял что переименовывать.
+    Dim allLegsSimplified As Boolean = True
+    For i As Integer = 0 To 5
+        If Not legs(i).coxa_com_simplified _
+           AndAlso Not legs(i).femur_com_simplified _
+           AndAlso Not legs(i).tibia_com_simplified Then
+            allLegsSimplified = False
+            Exit For
+        End If
+    Next
+    If allLegsSimplified Then
+        sb.AppendLine()
+        sb.AppendLine("СУСТАВЫ В СБОРКЕ (нужно переименовать в joint_L1_coxa…joint_R3_tibia):")
+        sb.AppendLine(ListAllJointNames(oCompDef))
+    End If
+
+    MessageBox.Show(sb.ToString(), "Hexapod model: extracted",
+                    MessageBoxButtons.OK,
+                    IIf(warnings.Count > 0, MessageBoxIcon.Warning, MessageBoxIcon.Information))
+End Sub
+
+
+' ============================================================
+'   STRUCT для ноги
+' ============================================================
+Class LegInfo
+    Public label As String
+    Public yaw As Double
+    Public attach_x, attach_y, attach_z As Double
+    Public coxa_len, femur_len, tibia_len As Double
+    Public coxa_mass, femur_mass, tibia_mass As Double
+    Public coxa_com()  As Double
+    Public femur_com() As Double
+    Public tibia_com() As Double
+    Public coxa_com_simplified  As Boolean
+    Public femur_com_simplified As Boolean
+    Public tibia_com_simplified As Boolean
+End Class
+
+
+' ============================================================
+'   ЧТЕНИЕ USER PARAMETER (см)
+' ============================================================
+Function ReadUserParamCm(oCompDef As AssemblyComponentDefinition,
+                          ByVal name As String,
+                          warnings As System.Collections.Generic.List(Of String)) As Double
+    Try
+        Return CDbl(oCompDef.Parameters.UserParameters.Item(name).Value)
+    Catch
+        warnings.Add("Не найден User Parameter '" & name & "' — использовано 0.")
+        Return 0.0
+    End Try
+End Function
+
+
+Function ReadUserParamCmOpt(oCompDef As AssemblyComponentDefinition,
+                             ByVal name As String) As Double
+    Try
+        Return CDbl(oCompDef.Parameters.UserParameters.Item(name).Value)
+    Catch
+        Return 0.0
+    End Try
+End Function
+
+
+' Создаёт User Parameter с дефолтным значением (мм), если его нет.
+' Возвращает True, если параметр был создан в этом вызове.
+Function EnsureUserParam(oCompDef As AssemblyComponentDefinition,
+                          ByVal name As String,
+                          ByVal defaultMm As Double,
+                          warnings As System.Collections.Generic.List(Of String)) As Boolean
+    Try
+        Dim p As Parameter = oCompDef.Parameters.UserParameters.Item(name)
+        Return False  ' уже есть
+    Catch
+        ' нет — создаём ниже
+    End Try
+
+    Dim invc As System.Globalization.CultureInfo = System.Globalization.CultureInfo.InvariantCulture
+    Dim expr As String = defaultMm.ToString("0.##", invc) & " mm"
+    Try
+        oCompDef.Parameters.UserParameters.AddByExpression(name, expr, "mm")
+        warnings.Add("Создан User Parameter '" & name & "' = " & expr & " (поставь реальное значение!).")
+        Return True
+    Catch ex As Exception
+        warnings.Add("Не удалось автосоздать '" & name & "' (" & ex.Message & "). Создай вручную: Manage → Parameters → Add Numeric.")
+        Return False
+    End Try
+End Function
+
+
+Function ListAllJointNames(oCompDef As AssemblyComponentDefinition) As String
+    Dim sb  As New System.Text.StringBuilder()
+    Dim cnt As Integer = 0
+    For Each j As AssemblyJoint In oCompDef.Joints
+        sb.AppendLine("    " & j.Name & "   [" & j.Definition.JointType.ToString() & "]")
+        cnt += 1
+        If cnt >= 60 Then
+            sb.AppendLine("    ... (всего " & oCompDef.Joints.Count & ", обрезано)")
+            Exit For
+        End If
+    Next
+    If cnt = 0 Then sb.AppendLine("    (нет ни одного AssemblyJoint в сборке)")
+    Return sb.ToString()
+End Function
+
+
+' ============================================================
+'   ПОИСК OCCURRENCE / JOINT
+' ============================================================
+Function FindOccurrenceByName(oCompDef As AssemblyComponentDefinition,
+                              ByVal nameOrSubstr As String) As ComponentOccurrence
+    For Each o As ComponentOccurrence In oCompDef.Occurrences
+        If String.Equals(o.Name, nameOrSubstr, StringComparison.OrdinalIgnoreCase) Then
+            Return o
+        End If
+    Next
+    For Each o As ComponentOccurrence In oCompDef.Occurrences
+        If o.Name.IndexOf(nameOrSubstr, StringComparison.OrdinalIgnoreCase) >= 0 Then
+            Return o
+        End If
+    Next
+    Return Nothing
+End Function
+
+
+Function FindSubOccByTokens(parentOcc As ComponentOccurrence,
+                             tokens() As String) As ComponentOccurrence
+    If parentOcc Is Nothing Then Return Nothing
+    For Each sub_o As ComponentOccurrence In parentOcc.SubOccurrences
+        For Each tok As String In tokens
+            If sub_o.Name.IndexOf(tok, StringComparison.OrdinalIgnoreCase) >= 0 Then
+                Return sub_o
+            End If
+        Next
+    Next
+    Return Nothing
+End Function
+
+
+Function FindJointByName(oCompDef As AssemblyComponentDefinition,
+                         ByVal name As String) As AssemblyJoint
+    For Each j As AssemblyJoint In oCompDef.Joints
+        If String.Equals(j.Name, name, StringComparison.OrdinalIgnoreCase) Then
+            Return j
+        End If
+    Next
+    Return Nothing
+End Function
+
+
+Function ReadAngularPositionRad(oJoint As AssemblyJoint) As Double
+    Dim jt As AssemblyJointTypeEnum = oJoint.Definition.JointType
+    If jt = AssemblyJointTypeEnum.kRotationalJointType _
+       OrElse jt = AssemblyJointTypeEnum.kCylindricalJointType Then
+        Return CDbl(oJoint.Definition.AngularPosition.Value)
+    End If
+    Throw New Exception("Сустав '" & oJoint.Name &
+        "' не вращательный (JointType=" & jt.ToString() & ").")
+End Function
+
+
+' ============================================================
+'   ЧТЕНИЕ МАССЫ И ЦМ
+' ============================================================
+Function SafeMassKg(occ As ComponentOccurrence,
+                     ByVal label As String,
+                     warnings As System.Collections.Generic.List(Of String)) As Double
+    If occ Is Nothing Then
+        warnings.Add(label & ": occurrence не найден — масса = 0.")
+        Return 0.0
+    End If
+    Try
+        Dim mp As MassProperties = occ.MassProperties
+        Dim m_kg As Double = CDbl(mp.Mass)
+        If m_kg <= 0.0000001 Then
+            warnings.Add(label & ": Mass=0 (нет материала?)")
+        End If
+        Return m_kg
+    Catch ex As Exception
+        warnings.Add(label & ": ошибка чтения массы — " & ex.Message)
+        Return 0.0
+    End Try
+End Function
+
+
+Function ReadComMeters(occ As ComponentOccurrence) As Double()
+    If occ Is Nothing Then Return Nothing
+    Try
+        Dim mp As MassProperties = occ.MassProperties
+        Dim p As Inventor.Point = mp.CenterOfMass
+        Return New Double() {p.X / 100.0, p.Y / 100.0, p.Z / 100.0}
+    Catch
+        Return Nothing
+    End Try
+End Function
+
+
+' Позиция origin'а occurrence в мировой СК (м).
+' oOcc.Transformation для sub-occurrence отдаётся в СК верхней сборки.
+Function OccPositionMeters(occ As ComponentOccurrence) As Double()
+    If occ Is Nothing Then Return Nothing
+    Try
+        Dim t As Inventor.Matrix = occ.Transformation
+        Return New Double() {t.Cell(1, 4) / 100.0, t.Cell(2, 4) / 100.0, t.Cell(3, 4) / 100.0}
+    Catch
+        Return Nothing
+    End Try
+End Function
+
+
+' ============================================================
+'   МАТЕМАТИКА: 3-вектор и 3×3 матрица
+' ============================================================
+Sub SetIdentity3(m(,) As Double)
+    For i As Integer = 0 To 2
+        For j As Integer = 0 To 2
+            m(i, j) = If(i = j, 1.0, 0.0)
+        Next
+    Next
+End Sub
+
+
+Function MatMul3(a(,) As Double, b(,) As Double) As Double(,)
+    Dim r(2, 2) As Double
+    For i As Integer = 0 To 2
+        For j As Integer = 0 To 2
+            r(i, j) = a(i, 0) * b(0, j) + a(i, 1) * b(1, j) + a(i, 2) * b(2, j)
+        Next
+    Next
+    Return r
+End Function
+
+
+Function MatVec3(a(,) As Double, v() As Double) As Double()
+    Return New Double() {
+        a(0, 0) * v(0) + a(0, 1) * v(1) + a(0, 2) * v(2),
+        a(1, 0) * v(0) + a(1, 1) * v(1) + a(1, 2) * v(2),
+        a(2, 0) * v(0) + a(2, 1) * v(1) + a(2, 2) * v(2)
+    }
+End Function
+
+
+Function MatT3(a(,) As Double) As Double(,)
+    Dim r(2, 2) As Double
+    For i As Integer = 0 To 2
+        For j As Integer = 0 To 2
+            r(i, j) = a(j, i)
+        Next
+    Next
+    Return r
+End Function
+
+
+Function AddVec(a() As Double, b() As Double) As Double()
+    Return New Double() {a(0) + b(0), a(1) + b(1), a(2) + b(2)}
+End Function
+
+
+Function SubVec(a() As Double, b() As Double) As Double()
+    Return New Double() {a(0) - b(0), a(1) - b(1), a(2) - b(2)}
+End Function
+
+
+Function VecNorm(v() As Double) As Double
+    Return Math.Sqrt(v(0) * v(0) + v(1) * v(1) + v(2) * v(2))
+End Function
+
+
+Function RzMat(theta As Double) As Double(,)
+    Dim c As Double = Math.Cos(theta)
+    Dim s As Double = Math.Sin(theta)
+    Dim r(2, 2) As Double
+    r(0, 0) = c  : r(0, 1) = -s : r(0, 2) = 0
+    r(1, 0) = s  : r(1, 1) =  c : r(1, 2) = 0
+    r(2, 0) = 0  : r(2, 1) =  0 : r(2, 2) = 1
+    Return r
+End Function
+
+
+Function RyMat(theta As Double) As Double(,)
+    Dim c As Double = Math.Cos(theta)
+    Dim s As Double = Math.Sin(theta)
+    Dim r(2, 2) As Double
+    r(0, 0) =  c : r(0, 1) = 0 : r(0, 2) = s
+    r(1, 0) =  0 : r(1, 1) = 1 : r(1, 2) = 0
+    r(2, 0) = -s : r(2, 1) = 0 : r(2, 2) = c
+    Return r
+End Function
+
+
+' ============================================================
+'   ЗАПИСЬ MODEL.JSON
+' ============================================================
+Sub WriteModelJson(ByVal path As String,
+                   ByVal body_mass_kg As Double,
+                   body_origin_m() As Double,
+                   ByVal body_off_x As Double,
+                   ByVal body_off_y As Double,
+                   ByVal body_off_z As Double,
+                   legs() As LegInfo,
+                   ByVal allComsResolved As Boolean)
+
+    Dim inv As System.Globalization.CultureInfo = System.Globalization.CultureInfo.InvariantCulture
+    Dim sb  As New System.Text.StringBuilder()
+
+    sb.AppendLine("{")
+    sb.AppendLine("  ""_comment"": ""Сгенерировано extract_model.iLogicVb из Inventor 2026."",")
+    sb.Append("  ""_simplified"": ").Append(If(allComsResolved, "false", "true")).AppendLine(",")
+    sb.AppendLine("  ""_notes"": [")
+    If allComsResolved Then
+        sb.AppendLine("    ""Все ЦМ звеньев получены из MassProperties.CenterOfMass с трансформацией в локальную СК звена."",")
+    Else
+        sb.AppendLine("    ""Часть ЦМ упрощена до [length/2, 0, 0] (см. *_com_simplified рядом с каждым звеном)."",")
+    End If
+    sb.AppendLine("    ""yaw_offset захардкожены: L1=+60, L2=+90, L3=+120, R1=-60, R2=-90, R3=-120"",")
+    sb.AppendLine("    ""coxa_attachment вычислен из body_radius и yaw_offset"",")
+    sb.AppendLine("    ""body_origin / body_R прочитаны из Transformation тела""")
+    sb.AppendLine("  ],")
+    sb.AppendLine("  ""_units"": { ""length"": ""m"", ""mass"": ""kg"", ""gravity"": ""m/s^2"", ""torque_output"": ""N*m"" },")
+    sb.AppendLine()
+    sb.AppendLine("  ""gravity"": [0, 0, -9.81],")
+    sb.AppendLine()
+
+    sb.AppendLine("  ""body"": {")
+    sb.Append("    ""mass"": ").Append(D(body_mass_kg, inv)).AppendLine(",")
+    sb.Append("    ""origin"": [")
+    sb.Append(D(body_origin_m(0), inv)).Append(", ")
+    sb.Append(D(body_origin_m(1), inv)).Append(", ")
+    sb.Append(D(body_origin_m(2), inv)).AppendLine("],")
+    sb.Append("    ""com"": [")
+    sb.Append(D(body_off_x, inv)).Append(", ")
+    sb.Append(D(body_off_y, inv)).Append(", ")
+    sb.Append(D(body_off_z, inv)).AppendLine("]")
+    sb.AppendLine("  },")
+    sb.AppendLine()
+
+    sb.AppendLine("  ""legs"": [")
+    For i As Integer = 0 To 5
+        Dim L As LegInfo = legs(i)
+        sb.AppendLine("    {")
+        sb.Append("      ""_name"": """).Append(JsonEscape(L.label)).AppendLine(""",")
+        sb.Append("      ""yaw_offset"": ").Append(D(L.yaw, inv)).AppendLine(",")
+        sb.Append("      ""coxa_attachment"": [")
+        sb.Append(D(L.attach_x, inv)).Append(", ")
+        sb.Append(D(L.attach_y, inv)).Append(", ")
+        sb.Append(D(L.attach_z, inv)).AppendLine("],")
+
+        sb.Append("      ""coxa_length"": ").Append(D(L.coxa_len, inv)).AppendLine(",")
+        sb.Append("      ""coxa_mass"": ").Append(D(L.coxa_mass, inv)).AppendLine(",")
+        sb.Append("      ""coxa_com"": [")
+        sb.Append(D(L.coxa_com(0), inv)).Append(", ")
+        sb.Append(D(L.coxa_com(1), inv)).Append(", ")
+        sb.Append(D(L.coxa_com(2), inv)).Append("]")
+        If L.coxa_com_simplified Then
+            sb.AppendLine(", ""coxa_com_simplified"": true,")
+        Else
+            sb.AppendLine(",")
+        End If
+
+        sb.Append("      ""femur_length"": ").Append(D(L.femur_len, inv)).AppendLine(",")
+        sb.Append("      ""femur_mass"": ").Append(D(L.femur_mass, inv)).AppendLine(",")
+        sb.Append("      ""femur_com"": [")
+        sb.Append(D(L.femur_com(0), inv)).Append(", ")
+        sb.Append(D(L.femur_com(1), inv)).Append(", ")
+        sb.Append(D(L.femur_com(2), inv)).Append("]")
+        If L.femur_com_simplified Then
+            sb.AppendLine(", ""femur_com_simplified"": true,")
+        Else
+            sb.AppendLine(",")
+        End If
+
+        sb.Append("      ""tibia_length"": ").Append(D(L.tibia_len, inv)).AppendLine(",")
+        sb.Append("      ""tibia_mass"": ").Append(D(L.tibia_mass, inv)).AppendLine(",")
+        sb.Append("      ""tibia_com"": [")
+        sb.Append(D(L.tibia_com(0), inv)).Append(", ")
+        sb.Append(D(L.tibia_com(1), inv)).Append(", ")
+        sb.Append(D(L.tibia_com(2), inv)).Append("]")
+        If L.tibia_com_simplified Then
+            sb.AppendLine(", ""tibia_com_simplified"": true")
+        Else
+            sb.AppendLine()
+        End If
+
+        If i < 5 Then
+            sb.AppendLine("    },")
+        Else
+            sb.AppendLine("    }")
+        End If
+    Next
+    sb.AppendLine("  ]")
+    sb.AppendLine("}")
+
+    System.IO.File.WriteAllText(path, sb.ToString(), New System.Text.UTF8Encoding(False))
+End Sub
+
+
+Function D(ByVal v As Double, inv As System.Globalization.CultureInfo) As String
+    Return v.ToString("0.######", inv)
+End Function
+
+
+Function JsonEscape(ByVal s As String) As String
+    If s Is Nothing Then Return ""
+    Dim sb As New System.Text.StringBuilder(s.Length + 2)
+    For Each c As Char In s
+        Select Case c
+            Case """"c    : sb.Append("\""")
+            Case "\"c     : sb.Append("\\")
+            Case ChrW(8)  : sb.Append("\b")
+            Case ChrW(9)  : sb.Append("\t")
+            Case ChrW(10) : sb.Append("\n")
+            Case ChrW(12) : sb.Append("\f")
+            Case ChrW(13) : sb.Append("\r")
+            Case Else
+                If AscW(c) < 32 Then
+                    sb.Append("\u").Append(AscW(c).ToString("X4"))
+                Else
+                    sb.Append(c)
+                End If
+        End Select
+    Next
+    Return sb.ToString()
+End Function
+
+
+Function ResolveRelative(ByVal baseDir As String, ByVal relPath As String) As String
+    If System.IO.Path.IsPathRooted(relPath) Then Return relPath
+    Try
+        Return System.IO.Path.GetFullPath(System.IO.Path.Combine(baseDir, relPath))
+    Catch
+        Return System.IO.Path.Combine(baseDir, relPath)
+    End Try
+End Function
