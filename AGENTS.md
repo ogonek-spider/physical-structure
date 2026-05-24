@@ -16,6 +16,7 @@ Spider use wave gate, one leg in air at once.
 
 * two neptune4 max printers
 * qidi q2 printer + qidi box
+* TTC 450 ultra CNC with 800w makita trimmer
 
 # Memory
 At the start of every session, read [MEMORY.md](MEMORY.md) and all files it links to.

@@ -40,17 +40,39 @@ Limb gravity torque:               19 Nm  (opposes GRF)
 Net motor torque:   101 − 19   =  82 Nm
 ```
 
-### Safety margins (gearbox efficiency 90% per stage = 204 Nm available)
+### Safety margins
+
+Thermal limit: **15 A max phase current** (25 A melts rotor).
+Motor Kt = 0.22 Nm/A. Available torque = N × 0.22 × 15 × 0.81 = N × 2.67 Nm.
+
+**Current 1:36 gearbox (98 Nm at 15 A):**
 | Joint | Required | Available | Safety |
 |-------|----------|-----------|--------|
-| Femur | 137 Nm   | 204 Nm    | 1.49×  |
-| Tibia |  82 Nm   | 204 Nm    | 2.49×  |
-| Coxa  | ~15 Nm   | 204 Nm    | >>1    |
+| Femur | 137 Nm   |  98 Nm    | **0.71× FAIL** |
+| Tibia |  82 Nm   |  98 Nm    | 1.20×  |
+| Coxa  | ~15 Nm   |  98 Nm    | >>1    |
 
-Swing phase: femur 55 Nm, tibia 19 Nm (trivial).
+**Required: 1:64 gearbox for femur (171 Nm at 15 A):**
+| Joint | Required | Available | Safety |
+|-------|----------|-----------|--------|
+| Femur | 137 Nm   | 171 Nm    | **1.25×** ✓ |
+| Tibia |  82 Nm   | 171 Nm    | 2.08×  |
+| Coxa  | ~15 Nm   | 171 Nm    | >>1    |
+
+Minimum ratio for femur (exact): 51.3 → **use 1:64** (two stages of 8:1).
+Tibia could stay at 1:36 (1.20×) or move to 1:64 for margin and spare-parts commonality.
+
+**1:64 planetary gearbox parameters (module 2mm):**
+- Sun = 10 T, Ring = 70 T, Planet = 30 T
+- Stage ratio = Ring/Sun + 1 = 8; two stages = 64
+- Ring = Sun + 2 × Planet → 70 = 10 + 60 ✓
+- Keep same: 3 planets, helical 15°, depth 16 mm
+
+Swing phase: femur 55 Nm, tibia 19 Nm (trivial at either ratio).
 
 ### Key risks
-- **Motor thermals**: stance demands ~51% of stall torque continuously. ACS712 current limiting must be calibrated.
+- **Motor thermals**: 15 A is the hard ceiling — ACS712 calibration (motors.md FIXME) must be completed before field use.
+- **Sun gear fatigue (1:64)**: smaller sun (10 T vs 12 T) — higher contact stress, carry extra sun gears as spares.
 - **Battery runtime**: 57–114 min per 2-pack charge. 3–4 h sessions require ~4–6 packs or rotation plan.
 - **Sun gear fatigue**: contact stress ~83 MPa vs 75 MPa limit — marginal, carry spares.
 
@@ -81,5 +103,5 @@ Bearing area per bolt: 6×3×2 walls = 36 mm²
 
 Bolt bearing analysis (АД31т, bearing allowable ~109 MPa):
 - Nominal (137 Nm): 137,000/(4×17.7)/36 = 54 MPa   ✓
-- Max    (204 Nm): 204,000/(4×17.7)/36 = 80 MPa   ✓
+- Max    (171 Nm): 171,000/(4×17.7)/36 = 67 MPa   ✓
 - Use steel nuts, no PETG threads at bolt holes
