@@ -54,6 +54,8 @@ If limb lengths are revisited: verify femur torque = 299×(L2·cosα + L3·cosβ
 
 ## Gearbox Analysis
 
+Motor rotor: PLA, 100% infill, printed at 45 degrees. PETG is not stiff enough for the rotor.
+
 Two-stage planetary 36:1 (6×6), module 2mm, helix 15°, face width 16mm, Z_s=12/Z_p=24/Z_r=60, 3 planets, PA6-CF gears.
 
 At actual 129 Nm femur output (not 172 Nm):

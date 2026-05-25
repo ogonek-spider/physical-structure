@@ -42,7 +42,8 @@ Net motor torque:   101 − 19   =  82 Nm
 
 ### Safety margins
 
-Thermal limit: **15 A max phase current** (25 A melts rotor).
+Thermal limit: **15 A max phase current** (25 A melts the PLA rotor).
+Motor rotor is PLA, 100% infill, printed at 45 degrees. PETG is not stiff enough for the rotor.
 Motor Kt = 0.22 Nm/A. Available torque = N × 0.22 × 15 × 0.81 = N × 2.67 Nm.
 
 **Current 1:36 gearbox (98 Nm at 15 A):**

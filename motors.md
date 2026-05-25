@@ -1,6 +1,9 @@
 I have 18 motors from hoverboard 7nm torque (at ~32 A; measured Kt_motor = 0.22 Nm/A).
 
-Motor casing is 3d printed from petg
+Motor rotor is 3d printed from PLA:
+- 100% infill
+- printed at 45 degrees
+- PETG is not stiff enough for the rotor
 
 Motors have magnetic absolute encoder and current sensor. 
 Weight of one motor is 1.5kg. Full joint weight about 5kg
@@ -15,7 +18,7 @@ Motors have 3d printed two stage planetary 1:36 gearbox.
 | Holding (stall)  | 15 A        | 98 Nm         |
 | Lifting (dynamic)| 25 A        | ≥ 98 Nm       |
 
-**Thermal limit: 15 A. 25 A melts the rotor — do not use.**
+**Thermal limit: 15 A. 25 A melts the PLA rotor — do not use.**
 
 Motor torque constant: Kt_motor = 98 / (15 × 36 × 0.81) = **0.22 Nm/A**
 
